@@ -7,16 +7,33 @@
 )]
 #![deny(clippy::large_stack_frames)]
 
+use core::cell::RefCell;
+use core::fmt::Write;
+
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
+use embedded_graphics::mono_font::ascii::{FONT_6X10, FONT_10X20};
+use embedded_graphics::mono_font::{MonoTextStyle, MonoTextStyleBuilder};
+use embedded_graphics::pixelcolor::Rgb565;
+use embedded_graphics::prelude::*;
+use embedded_graphics::primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Rectangle};
+use embedded_graphics::text::Text;
+use embedded_hal::spi::SpiDevice;
+use embedded_hal_bus::spi::RefCellDevice;
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
+use esp_hal::delay::Delay;
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig};
 use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::spi::Mode;
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
+use heapless::String;
 use log::{error, info};
+use mipidsi::interface::SpiInterface;
+use mipidsi::models::ST7789;
+use mipidsi::options::{ColorInversion, Orientation, Rotation};
+use mipidsi::Builder;
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
@@ -28,6 +45,13 @@ const OP_READ_REGISTER: u8 = 0x1D;
 // LoRa sync word register (reset value 0x1424)
 const REG_SYNC_WORD_MSB: u16 = 0x0740;
 
+// Adafruit 1.14" 240x135 TFT (ST7789) sits in the middle of the controller's
+// 240x320 RAM. Offsets are for the native portrait orientation.
+const DISPLAY_WIDTH: u16 = 135;
+const DISPLAY_HEIGHT: u16 = 240;
+const DISPLAY_OFFSET_X: u16 = 52;
+const DISPLAY_OFFSET_Y: u16 = 40;
+
 async fn wait_busy_low(busy: &Input<'_>) -> bool {
     for _ in 0..100 {
         if busy.is_low() {
@@ -36,6 +60,85 @@ async fn wait_busy_low(busy: &Input<'_>) -> bool {
         Timer::after(Duration::from_millis(1)).await;
     }
     false
+}
+
+/// Result of one radio check, shown on the display.
+enum RadioCheck {
+    Ok { status: u8, sync: u16 },
+    BadSync { status: u8, sync: u16 },
+    BusyStuck,
+    SpiError,
+}
+
+fn draw_frame<D>(display: &mut D, check: &RadioCheck, tick: u32) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let size = display.bounding_box().size;
+
+    // Border exactly at the panel edge: if it is clipped or offset, the
+    // DISPLAY_OFFSET_* constants need adjusting.
+    Rectangle::new(Point::zero(), size)
+        .into_styled(PrimitiveStyle::with_stroke(Rgb565::WHITE, 1))
+        .draw(display)?;
+
+    let title = MonoTextStyle::new(&FONT_10X20, Rgb565::CYAN);
+    Text::new("XIAO", Point::new(10, 28), title).draw(display)?;
+    Text::new("ESP32-S3", Point::new(10, 52), title).draw(display)?;
+
+    // Background color overwrites the previous frame's text without clearing.
+    let line = |color| {
+        MonoTextStyleBuilder::new()
+            .font(&FONT_10X20)
+            .text_color(color)
+            .background_color(Rgb565::BLACK)
+            .build()
+    };
+    let small = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(Rgb565::WHITE)
+        .background_color(Rgb565::BLACK)
+        .build();
+
+    // Portrait is 135 px wide: 12 chars of the 10x20 font, 20 of the 6x10 font.
+    let mut text: String<32> = String::new();
+    let (label, color) = match check {
+        RadioCheck::Ok { .. } => ("OK          ", Rgb565::GREEN),
+        RadioCheck::BadSync { .. } => ("BAD SYNC    ", Rgb565::YELLOW),
+        RadioCheck::BusyStuck => ("BUSY HIGH   ", Rgb565::RED),
+        RadioCheck::SpiError => ("SPI ERROR   ", Rgb565::RED),
+    };
+    Text::new("SX1262", Point::new(10, 90), line(Rgb565::WHITE)).draw(display)?;
+    Text::new(label, Point::new(10, 114), line(color)).draw(display)?;
+
+    match check {
+        RadioCheck::Ok { status, sync } | RadioCheck::BadSync { status, sync } => {
+            let _ = write!(text, "status 0x{status:02X}      ");
+            Text::new(&text, Point::new(10, 140), small).draw(display)?;
+            text.clear();
+            let _ = write!(text, "sync   0x{sync:04X}    ");
+            Text::new(&text, Point::new(10, 152), small).draw(display)?;
+        }
+        _ => {
+            Text::new("no response        ", Point::new(10, 140), small).draw(display)?;
+            Text::new("                   ", Point::new(10, 152), small).draw(display)?;
+        }
+    }
+
+    text.clear();
+    let _ = write!(text, "check #{tick}      ");
+    Text::new(&text, Point::new(10, 164), small).draw(display)?;
+
+    // Color bars: red, green, blue. Wrong order or inverted colors show here.
+    let bar = |x, color| {
+        Rectangle::new(Point::new(x, 190), Size::new(35, 30))
+            .into_styled(PrimitiveStyleBuilder::new().fill_color(color).build())
+    };
+    bar(8, Rgb565::RED).draw(display)?;
+    bar(50, Rgb565::GREEN).draw(display)?;
+    bar(92, Rgb565::BLUE).draw(display)?;
+
+    Ok(())
 }
 
 #[allow(
@@ -55,67 +158,100 @@ async fn main(_spawner: Spawner) -> ! {
     info!("Embassy initialized!");
 
     // Wio-SX1262 on XIAO ESP32S3
-    let mut nss = Output::new(peripherals.GPIO41, Level::High, OutputConfig::default());
+    let nss = Output::new(peripherals.GPIO41, Level::High, OutputConfig::default());
     let mut reset = Output::new(peripherals.GPIO42, Level::High, OutputConfig::default());
     let busy = Input::new(peripherals.GPIO40, InputConfig::default());
 
-    let mut spi = Spi::new(
+    // Display: Adafruit 1.14" TFT. CL=D8(SCK), DA=D10(MOSI), CS=D6, DC=D7
+    let display_cs = Output::new(peripherals.GPIO43, Level::High, OutputConfig::default());
+    let display_dc = Output::new(peripherals.GPIO44, Level::Low, OutputConfig::default());
+
+    // One SPI bus shared by the radio and the display, each with its own CS.
+    // 10 MHz is within both the SX1262 (16 MHz max) and the ST7789 limits.
+    let spi = Spi::new(
         peripherals.SPI2,
         SpiConfig::default()
-            .with_frequency(Rate::from_khz(1000))
+            .with_frequency(Rate::from_mhz(10))
             .with_mode(Mode::_0),
     )
     .expect("spi config")
     .with_sck(peripherals.GPIO7)
     .with_miso(peripherals.GPIO8)
     .with_mosi(peripherals.GPIO9);
+    let spi_bus = RefCell::new(spi);
 
+    let mut radio = RefCellDevice::new(&spi_bus, nss, Delay::new()).expect("radio cs");
+    let display_spi = RefCellDevice::new(&spi_bus, display_cs, Delay::new()).expect("display cs");
+
+    let mut display_buf = [0u8; 512];
+    let di = SpiInterface::new(display_spi, display_dc, &mut display_buf);
+    let mut display = Builder::new(ST7789, di)
+        .display_size(DISPLAY_WIDTH, DISPLAY_HEIGHT)
+        .display_offset(DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y)
+        .orientation(Orientation::new().rotate(Rotation::Deg0))
+        .invert_colors(ColorInversion::Inverted)
+        .init(&mut Delay::new())
+        .expect("display init");
+    display.clear(Rgb565::BLACK).expect("display clear");
+    info!("Display initialized");
+
+    let mut tick: u32 = 0;
     loop {
+        tick += 1;
+
         // Hardware reset
         reset.set_low();
         Timer::after(Duration::from_millis(5)).await;
         reset.set_high();
         Timer::after(Duration::from_millis(10)).await;
 
-        if !wait_busy_low(&busy).await {
+        let check = if !wait_busy_low(&busy).await {
             error!("BUSY stuck high after reset (check wiring/pins)");
-            Timer::after(Duration::from_secs(2)).await;
-            continue;
-        }
+            RadioCheck::BusyStuck
+        } else {
+            // GetStatus: opcode, then one status byte
+            let mut status = [OP_GET_STATUS, 0x00];
+            match radio.transfer_in_place(&mut status) {
+                Ok(()) => info!(
+                    "GetStatus -> 0x{:02X} (chip mode {}, cmd status {})",
+                    status[1],
+                    (status[1] >> 4) & 0x7,
+                    (status[1] >> 1) & 0x7
+                ),
+                Err(e) => error!("GetStatus SPI error: {:?}", e),
+            }
 
-        // GetStatus: opcode, then one status byte
-        let mut status = [OP_GET_STATUS, 0x00];
-        nss.set_low();
-        let r = spi.transfer(&mut status);
-        nss.set_high();
-        match r {
-            Ok(()) => info!(
-                "GetStatus -> 0x{:02X} (chip mode {}, cmd status {})",
-                status[1],
-                (status[1] >> 4) & 0x7,
-                (status[1] >> 1) & 0x7
-            ),
-            Err(e) => error!("GetStatus SPI error: {:?}", e),
-        }
+            wait_busy_low(&busy).await;
 
-        wait_busy_low(&busy).await;
-
-        // ReadRegister: opcode, addr hi, addr lo, NOP/status, then data bytes
-        let [hi, lo] = REG_SYNC_WORD_MSB.to_be_bytes();
-        let mut buf = [OP_READ_REGISTER, hi, lo, 0x00, 0x00, 0x00];
-        nss.set_low();
-        let r = spi.transfer(&mut buf);
-        nss.set_high();
-        match r {
-            Ok(()) => {
-                let sync = u16::from_be_bytes([buf[4], buf[5]]);
-                if sync == 0x1424 {
-                    info!("Sync word reg = 0x{:04X} (expected 0x1424) -> SX1262 OK", sync);
-                } else {
-                    error!("Sync word reg = 0x{:04X} (expected 0x1424)", sync);
+            // ReadRegister: opcode, addr hi, addr lo, NOP/status, then data bytes
+            let [hi, lo] = REG_SYNC_WORD_MSB.to_be_bytes();
+            let mut buf = [OP_READ_REGISTER, hi, lo, 0x00, 0x00, 0x00];
+            match radio.transfer_in_place(&mut buf) {
+                Ok(()) => {
+                    let sync = u16::from_be_bytes([buf[4], buf[5]]);
+                    if sync == 0x1424 {
+                        info!("Sync word reg = 0x{sync:04X} (expected 0x1424) -> SX1262 OK");
+                        RadioCheck::Ok {
+                            status: status[1],
+                            sync,
+                        }
+                    } else {
+                        error!("Sync word reg = 0x{sync:04X} (expected 0x1424)");
+                        RadioCheck::BadSync {
+                            status: status[1],
+                            sync,
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("ReadRegister SPI error: {:?}", e);
+                    RadioCheck::SpiError
                 }
             }
-            Err(e) => error!("ReadRegister SPI error: {:?}", e),
+        };
+
+        if let Err(e) = draw_frame(&mut display, &check, tick) {
+            error!("Display draw error: {:?}", e);
         }
 
         Timer::after(Duration::from_secs(2)).await;
