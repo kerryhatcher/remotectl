@@ -11,7 +11,13 @@ path = "./src/bin/main.rs"
 [dependencies]
 esp-hal = { version = "~1.2.2", features = ["esp32s3", "log-04", "unstable"] }
 
-esp-rtos = { version = "0.4.0", features = ["embassy", "esp32s3", "log-04"] }
+esp-rtos = { version = "0.4.0", features = [
+  "embassy",
+  "esp-alloc",
+  "esp-radio",
+  "esp32s3",
+  "log-04",
+] }
 
 esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32s3", "log-04"] }
 log                    = "0.4.27"
@@ -31,7 +37,20 @@ mipidsi = "0.10.0"
 embedded-graphics = "0.8.2"
 embedded-hal = "1.0.0"
 embedded-hal-bus = "0.3.0"
-heapless = "0.9.3"
+heapless = { version = "0.9.3", features = ["serde"] }
+picoserve = { version = "0.20.1", features = ["embassy", "log", "json"] }
+embassy-net = { version = "0.9.1", features = ["dhcpv4", "log", "medium-ethernet", "tcp"] }
+embassy-sync = "0.8.0"
+embassy-futures = "0.1.2"
+esp-alloc = { version = "0.11.0", features = ["esp32s3"] }
+esp-radio = { version = "1.0.0-beta.1", features = [
+  "esp-alloc",
+  "esp32s3",
+  "log-04",
+  "unstable",
+  "wifi",
+] }
+serde = { version = "1", default-features = false, features = ["derive"] }
 
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html

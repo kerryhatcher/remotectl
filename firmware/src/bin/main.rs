@@ -11,6 +11,7 @@ use core::cell::RefCell;
 use core::fmt::Write;
 
 use embassy_executor::Spawner;
+use embassy_futures::select::{Either, select};
 use embassy_time::{Duration, Timer};
 use embedded_graphics::mono_font::ascii::{FONT_6X10, FONT_10X20};
 use embedded_graphics::mono_font::{MonoTextStyle, MonoTextStyleBuilder};
@@ -24,16 +25,21 @@ use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::delay::Delay;
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig};
-use esp_hal::spi::master::{Config as SpiConfig, Spi};
+use esp_hal::rng::Rng;
 use esp_hal::spi::Mode;
+use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
+use firmware::shared::{DISPLAY_CMD, DisplayCmd, MESSAGE_LEN, RADIO, RadioStatus};
+use firmware::{api, wifi};
 use heapless::String;
 use log::{error, info};
+use mipidsi::Builder;
 use mipidsi::interface::SpiInterface;
 use mipidsi::models::ST7789;
 use mipidsi::options::{ColorInversion, Orientation, Rotation};
-use mipidsi::Builder;
+
+extern crate alloc;
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
@@ -70,7 +76,12 @@ enum RadioCheck {
     SpiError,
 }
 
-fn draw_frame<D>(display: &mut D, check: &RadioCheck, tick: u32) -> Result<(), D::Error>
+fn draw_frame<D>(
+    display: &mut D,
+    check: &RadioCheck,
+    tick: u32,
+    message: &str,
+) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,
 {
@@ -129,9 +140,20 @@ where
     let _ = write!(text, "check #{tick}      ");
     Text::new(&text, Point::new(10, 164), small).draw(display)?;
 
+    // Message from the REST API: up to 3 lines of 20 characters, padded so a
+    // shorter message overwrites the previous one.
+    for (i, y) in [182, 194, 206].into_iter().enumerate() {
+        let chunk = message
+            .get(i * 20..)
+            .map_or("", |rest| &rest[..rest.len().min(20)]);
+        text.clear();
+        let _ = write!(text, "{chunk:<20}");
+        Text::new(&text, Point::new(10, y), small).draw(display)?;
+    }
+
     // Color bars: red, green, blue. Wrong order or inverted colors show here.
     let bar = |x, color| {
-        Rectangle::new(Point::new(x, 190), Size::new(35, 30))
+        Rectangle::new(Point::new(x, 216), Size::new(35, 20))
             .into_styled(PrimitiveStyleBuilder::new().fill_color(color).build())
     };
     bar(8, Rgb565::RED).draw(display)?;
@@ -146,16 +168,26 @@ where
     reason = "it's not unusual to allocate larger buffers etc. in main"
 )]
 #[esp_rtos::main]
-async fn main(_spawner: Spawner) -> ! {
+async fn main(spawner: Spawner) -> ! {
     esp_println::logger::init_logger_from_env();
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
+    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 73744);
+
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
 
     info!("Embassy initialized!");
+
+    // Wi-Fi + REST API. Credentials and the API token are compiled in.
+    let rng = Rng::new();
+    let seed = (u64::from(rng.random()) << 32) | u64::from(rng.random());
+    let stack = wifi::start(&spawner, peripherals.WIFI, seed);
+    for id in 0..api::WEB_TASKS {
+        spawner.spawn(api::web_task(id, stack).expect("web task"));
+    }
 
     // Wio-SX1262 on XIAO ESP32S3
     let nss = Output::new(peripherals.GPIO41, Level::High, OutputConfig::default());
@@ -196,64 +228,112 @@ async fn main(_spawner: Spawner) -> ! {
     info!("Display initialized");
 
     let mut tick: u32 = 0;
+    let mut message: String<MESSAGE_LEN> = String::new();
+    let mut check = RadioCheck::BusyStuck;
+    let mut run_check = true;
     loop {
-        tick += 1;
+        if run_check {
+            tick += 1;
 
-        // Hardware reset
-        reset.set_low();
-        Timer::after(Duration::from_millis(5)).await;
-        reset.set_high();
-        Timer::after(Duration::from_millis(10)).await;
+            // Hardware reset
+            reset.set_low();
+            Timer::after(Duration::from_millis(5)).await;
+            reset.set_high();
+            Timer::after(Duration::from_millis(10)).await;
 
-        let check = if !wait_busy_low(&busy).await {
-            error!("BUSY stuck high after reset (check wiring/pins)");
-            RadioCheck::BusyStuck
-        } else {
-            // GetStatus: opcode, then one status byte
-            let mut status = [OP_GET_STATUS, 0x00];
-            match radio.transfer_in_place(&mut status) {
-                Ok(()) => info!(
-                    "GetStatus -> 0x{:02X} (chip mode {}, cmd status {})",
-                    status[1],
-                    (status[1] >> 4) & 0x7,
-                    (status[1] >> 1) & 0x7
-                ),
-                Err(e) => error!("GetStatus SPI error: {:?}", e),
-            }
+            check = if !wait_busy_low(&busy).await {
+                error!("BUSY stuck high after reset (check wiring/pins)");
+                RadioCheck::BusyStuck
+            } else {
+                // GetStatus: opcode, then one status byte
+                let mut status = [OP_GET_STATUS, 0x00];
+                match radio.transfer_in_place(&mut status) {
+                    Ok(()) => info!(
+                        "GetStatus -> 0x{:02X} (chip mode {}, cmd status {})",
+                        status[1],
+                        (status[1] >> 4) & 0x7,
+                        (status[1] >> 1) & 0x7
+                    ),
+                    Err(e) => error!("GetStatus SPI error: {:?}", e),
+                }
 
-            wait_busy_low(&busy).await;
+                wait_busy_low(&busy).await;
 
-            // ReadRegister: opcode, addr hi, addr lo, NOP/status, then data bytes
-            let [hi, lo] = REG_SYNC_WORD_MSB.to_be_bytes();
-            let mut buf = [OP_READ_REGISTER, hi, lo, 0x00, 0x00, 0x00];
-            match radio.transfer_in_place(&mut buf) {
-                Ok(()) => {
-                    let sync = u16::from_be_bytes([buf[4], buf[5]]);
-                    if sync == 0x1424 {
-                        info!("Sync word reg = 0x{sync:04X} (expected 0x1424) -> SX1262 OK");
-                        RadioCheck::Ok {
-                            status: status[1],
-                            sync,
-                        }
-                    } else {
-                        error!("Sync word reg = 0x{sync:04X} (expected 0x1424)");
-                        RadioCheck::BadSync {
-                            status: status[1],
-                            sync,
+                // ReadRegister: opcode, addr hi, addr lo, NOP/status, then data bytes
+                let [hi, lo] = REG_SYNC_WORD_MSB.to_be_bytes();
+                let mut buf = [OP_READ_REGISTER, hi, lo, 0x00, 0x00, 0x00];
+                match radio.transfer_in_place(&mut buf) {
+                    Ok(()) => {
+                        let sync = u16::from_be_bytes([buf[4], buf[5]]);
+                        if sync == 0x1424 {
+                            info!("Sync word reg = 0x{sync:04X} (expected 0x1424) -> SX1262 OK");
+                            RadioCheck::Ok {
+                                status: status[1],
+                                sync,
+                            }
+                        } else {
+                            error!("Sync word reg = 0x{sync:04X} (expected 0x1424)");
+                            RadioCheck::BadSync {
+                                status: status[1],
+                                sync,
+                            }
                         }
                     }
+                    Err(e) => {
+                        error!("ReadRegister SPI error: {:?}", e);
+                        RadioCheck::SpiError
+                    }
                 }
-                Err(e) => {
-                    error!("ReadRegister SPI error: {:?}", e);
-                    RadioCheck::SpiError
-                }
-            }
-        };
+            };
 
-        if let Err(e) = draw_frame(&mut display, &check, tick) {
+            RADIO.lock(|cell| {
+                *cell.borrow_mut() = match check {
+                    RadioCheck::Ok { status, sync } => RadioStatus {
+                        ok: true,
+                        checks: tick,
+                        status_byte: status,
+                        sync_word: sync,
+                    },
+                    RadioCheck::BadSync { status, sync } => RadioStatus {
+                        ok: false,
+                        checks: tick,
+                        status_byte: status,
+                        sync_word: sync,
+                    },
+                    RadioCheck::BusyStuck | RadioCheck::SpiError => RadioStatus {
+                        ok: false,
+                        checks: tick,
+                        status_byte: 0,
+                        sync_word: 0,
+                    },
+                };
+            });
+        }
+
+        if let Err(e) = draw_frame(&mut display, &check, tick, &message) {
             error!("Display draw error: {:?}", e);
         }
 
-        Timer::after(Duration::from_secs(2)).await;
+        // Re-check the radio every 2 s, or redraw right away when the API changes the message.
+        match select(Timer::after(Duration::from_secs(2)), DISPLAY_CMD.wait()).await {
+            Either::First(()) => run_check = true,
+            Either::Second(DisplayCmd::Show(text)) => {
+                message.clear();
+                // The display font is ASCII only.
+                for c in text.chars() {
+                    let _ = message.push(if c.is_ascii_graphic() || c == ' ' {
+                        c
+                    } else {
+                        '?'
+                    });
+                }
+                info!("Display message: {}", message.as_str());
+                run_check = false;
+            }
+            Either::Second(DisplayCmd::Clear) => {
+                message.clear();
+                run_check = false;
+            }
+        }
     }
 }
