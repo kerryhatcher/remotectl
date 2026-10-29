@@ -77,3 +77,62 @@ Pads D11 and D12 are the same GPIOs the Wio board uses for NRST and NSS.
 Besides the radio signals, the Wio board routes these XIAO GPIOs to its
 connector: `GPIO14`–`GPIO18`, `GPIO47`, `GPIO48` (LED) and `GPIO21` (button).
 `VIN` is the 5 V rail and `+3V3` powers the module.
+
+## Adafruit 1.14" TFT display (ADA6113)
+
+240x135 IPS, ST7789 driver, SPI. Adafruit guide:
+<https://learn.adafruit.com/adafruit-1-14-240x135-color-newxie-tft-display>.
+The board has no reset pin, so the driver does a software reset. It takes
+3.3–5 V power and has its own regulator and level shifter.
+
+### Wiring (as used by `firmware/`)
+
+The display shares the radio's SPI bus (SCK, MOSI) and has its own CS and DC.
+
+| Display pin | Function | XIAO pin | GPIO |
+|-------------|----------|----------|------|
+| V+ | Power | 3V3 | — |
+| G | Ground | GND | — |
+| CL | SPI clock | D8 / SCK | 7 |
+| DA | SPI data (MOSI) | D10 / MOSI | 9 |
+| CS | Chip select | D6 | 43 |
+| DC | Data/command | D7 | 44 |
+| BL | Backlight | not connected (on by default; tie to GND to turn off) | — |
+
+D5 (GPIO6) is left free as the only ADC-capable pin the Wio board passes through.
+GPIO43 and GPIO44 are the chip's UART pins. Logs use the USB serial/JTAG port, so they are free.
+
+### Header layout
+
+With the USB-C port pointing west:
+
+```
+                      NORTH row
+        5V/VIN  GND   3V3   D10    D9    D8    D7
+         │      │      │     │      │     │     │
+         │     [G]   [V+]   [DA]   ·    [CL]  [DC]
+   ┌─────┴──────┴──────┴─────┴──────┴─────┴─────┴──┐
+USB-C ◄ │                                           │
+(west)  └─────┬──────┬──────┬─────┬──────┬─────┬───┘
+              │      │      │     │      │     │     │
+              ·      ·      ·     ·      ·    [PT]  [CS]
+             D0     D1     D2    D3     D4    D5    D6
+                      SOUTH row
+```
+
+On the Wio board the same positions are labeled `VIN, GND, 3V3, MOSI, MISO, SCK, D7`
+(north) and `DIO1, BUSY, RST, NSS, RF-SW, D5, D6` (south). `[PT]` marks where a
+phototransistor would go.
+
+### Firmware settings
+
+| Setting | Value |
+|---------|-------|
+| SPI | Shared SPI2, mode 0, 10 MHz |
+| Display crate | `mipidsi` 0.10, `ST7789` model |
+| Size / offset | 135x240 native portrait, offset (52, 40) |
+| Rotation | `Deg0` (portrait) |
+| Color | `ColorInversion::Inverted` |
+
+The first run needs the border to line up with the panel edge. If it doesn't, adjust
+`DISPLAY_OFFSET_X` and `DISPLAY_OFFSET_Y` in `firmware/src/bin/main.rs`.
