@@ -38,7 +38,7 @@ embedded-graphics = "0.8.2"
 embedded-hal = "1.0.0"
 embedded-hal-bus = "0.3.0"
 heapless = { version = "0.9.3", features = ["serde"] }
-picoserve = { version = "0.20.1", features = ["embassy", "log", "json"] }
+picoserve = { version = "0.20.1", features = ["alloc", "embassy", "log", "json"] }
 embassy-net = { version = "0.9.1", features = ["dhcpv4", "log", "medium-ethernet", "tcp"] }
 embassy-sync = "0.8.0"
 embassy-futures = "0.1.2"
@@ -51,6 +51,7 @@ esp-radio = { version = "1.0.0-beta.1", features = [
   "wifi",
 ] }
 serde = { version = "1", default-features = false, features = ["derive"] }
+embassy-usb = "0.6"
 
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html

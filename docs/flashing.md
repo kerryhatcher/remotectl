@@ -37,7 +37,24 @@ espflash erase-flash            # wipe flash (removes Meshtastic and its setting
 
 `espflash` asks to confirm the serial port and whether to remember it. The port is `/dev/ttyACM0`.
 
+## Flashing after the USB keyboard firmware
+
+The firmware uses the USB pins (GPIO19/20) as a USB device, which replaces the
+USB-Serial-JTAG port. So there is no `/dev/ttyACM0`, no serial console and no automatic
+reset from `espflash`. Options:
+
+- `firmware/flash.sh` builds, calls `POST /bootloader` (needs `DEVICE_IP` and `API_TOKEN`),
+  waits for `/dev/ttyACM0` and retries `espflash flash --no-stub` up to 5 times. The ROM
+  download mode over this USB path is flaky, so retries are normal.
+- Manual: hold **B** while plugging in, then `espflash flash --chip esp32s3 --port
+  /dev/ttyACM0 <elf>`. This is the reliable route. Release **B** and tap **R** afterwards
+  to start the app (the chip stays in the bootloader while GPIO0 is low).
+- Do not clear `RTC_CNTL_USB_CONF` bits to force the JTAG PHY before reset. That hung the
+  chip and needed the manual method to recover.
+
 ## Log
 
 - 2026-10-29: first `cargo run` failed with `Failed to connect to the device`
   while Meshtastic was running. The board re-enumerated but no flash happened.
+- 2026-10-30: USB HID keyboard firmware. `POST /bootloader` reaches download mode, but
+  flashing through it failed on some attempts (stub: `MemData` timeout, no-stub: broken pipe).

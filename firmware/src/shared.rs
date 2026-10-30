@@ -45,3 +45,24 @@ pub static RSSI_DBM: AtomicI32 = AtomicI32::new(0);
 
 /// Number of authorized API requests served since boot.
 pub static REQUESTS: AtomicU32 = AtomicU32::new(0);
+
+/// Longest text accepted by one `POST /keyboard/type` request.
+pub const TYPE_MAX: usize = 256;
+
+/// Text for the USB keyboard to type.
+pub struct TypeJob {
+    pub text: String<TYPE_MAX>,
+    /// Pause after each key press and each release.
+    pub delay_ms: u16,
+}
+
+/// One job at a time: the API answers 503 while the keyboard is still typing.
+pub static TYPE_QUEUE: embassy_sync::channel::Channel<CriticalSectionRawMutex, TypeJob, 1> =
+    embassy_sync::channel::Channel::new();
+
+/// True while a USB host has configured the device (keyboard is usable).
+pub static USB_CONFIGURED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Raised by `POST /bootloader` to reboot into the ROM download mode.
+pub static BOOTLOADER: Signal<CriticalSectionRawMutex, ()> = Signal::new();

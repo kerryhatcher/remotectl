@@ -31,7 +31,7 @@ use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use firmware::shared::{DISPLAY_CMD, DisplayCmd, MESSAGE_LEN, RADIO, RadioStatus};
-use firmware::{api, wifi};
+use firmware::{api, system, usb_hid, wifi};
 use heapless::String;
 use log::{error, info};
 use mipidsi::Builder;
@@ -169,7 +169,8 @@ where
 )]
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
-    esp_println::logger::init_logger_from_env();
+    // No USB serial console (the USB port is a keyboard): logs go to a RAM buffer, see GET /logs.
+    firmware::logger::init(log::LevelFilter::Info);
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
@@ -188,6 +189,14 @@ async fn main(spawner: Spawner) -> ! {
     for id in 0..api::WEB_TASKS {
         spawner.spawn(api::web_task(id, stack).expect("web task"));
     }
+
+    usb_hid::start(
+        &spawner,
+        peripherals.USB_FS,
+        peripherals.GPIO20,
+        peripherals.GPIO19,
+    );
+    spawner.spawn(system::bootloader_task().expect("bootloader task"));
 
     // Wio-SX1262 on XIAO ESP32S3
     let nss = Output::new(peripherals.GPIO41, Level::High, OutputConfig::default());

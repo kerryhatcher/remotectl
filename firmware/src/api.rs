@@ -5,6 +5,9 @@
 //! | GET    | `/status`  | -                   | JSON device status               |
 //! | POST   | `/display` | `{"text": "hello"}` | Shows the text on the display    |
 //! | DELETE | `/display` | -                   | Clears the text                  |
+//! | POST   | `/keyboard/type` | `{"text": "...", "delay_ms": 15}` | Types the text on the USB host |
+//! | GET    | `/logs`    | -                   | Recent log lines as plain text   |
+//! | POST   | `/bootloader` | -                | Reboots into the ROM download mode |
 //!
 //! Every route needs the header `Authorization: Bearer <API_TOKEN>`.
 
@@ -14,19 +17,26 @@ use core::sync::atomic::Ordering;
 use embassy_net::Stack;
 use embassy_time::Instant;
 use heapless::String;
-use picoserve::extract::{FromRequestParts, Json as JsonBody};
+use picoserve::extract::{FromRequestParts, JsonWithUnescapeBufferSize};
 use picoserve::request::RequestParts;
 use picoserve::response::{IntoResponse, Json, StatusCode};
 use picoserve::routing::{PathRouter, get, post};
 use picoserve::{Config, Router};
 use serde::{Deserialize, Serialize};
 
-use crate::shared::{DISPLAY_CMD, DisplayCmd, IP_ADDR, MESSAGE_LEN, RADIO, REQUESTS, RSSI_DBM};
+use crate::shared::{
+    BOOTLOADER, DISPLAY_CMD, DisplayCmd, IP_ADDR, MESSAGE_LEN, RADIO, REQUESTS, RSSI_DBM, TYPE_MAX,
+    TYPE_QUEUE, TypeJob, USB_CONFIGURED,
+};
 
 // Set at build time, e.g. `API_TOKEN=$(openssl rand -hex 16) cargo run`.
 const API_TOKEN: &str = env!("API_TOKEN");
 
 const PORT: u16 = 80;
+
+/// Scratch space for unescaping JSON strings (`\n`, `\"`, ...). It has to hold the longest
+/// text accepted by any route, or such requests fail with "Invalid JSON".
+const UNESCAPE_BUFFER: usize = TYPE_MAX * 2;
 
 /// Compare without exiting early so timing does not reveal how much of the token matched.
 fn token_matches(candidate: &[u8]) -> bool {
@@ -79,12 +89,18 @@ struct RadioBody {
 }
 
 #[derive(Serialize)]
+struct UsbBody {
+    configured: bool,
+}
+
+#[derive(Serialize)]
 struct StatusBody {
     uptime_s: u64,
     heap_free: usize,
     requests: u32,
     wifi: WifiBody,
     radio: RadioBody,
+    usb: UsbBody,
 }
 
 async fn status(_: Authorized) -> impl IntoResponse {
@@ -108,6 +124,9 @@ async fn status(_: Authorized) -> impl IntoResponse {
             status_byte: radio.status_byte,
             sync_word: radio.sync_word,
         },
+        usb: UsbBody {
+            configured: USB_CONFIGURED.load(Ordering::Relaxed),
+        },
     })
 }
 
@@ -116,7 +135,13 @@ struct DisplayRequest {
     text: String<MESSAGE_LEN>,
 }
 
-async fn show_display(_: Authorized, JsonBody(request): JsonBody<DisplayRequest>) -> StatusCode {
+async fn show_display(
+    _: Authorized,
+    JsonWithUnescapeBufferSize(request): JsonWithUnescapeBufferSize<
+        DisplayRequest,
+        UNESCAPE_BUFFER,
+    >,
+) -> StatusCode {
     DISPLAY_CMD.signal(DisplayCmd::Show(request.text));
     StatusCode::NO_CONTENT
 }
@@ -126,10 +151,46 @@ async fn clear_display(_: Authorized) -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
+#[derive(Deserialize)]
+struct TypeRequest {
+    text: String<TYPE_MAX>,
+    /// Pause after each key press and release, in milliseconds. Defaults to 15.
+    delay_ms: Option<u16>,
+}
+
+async fn type_text(
+    _: Authorized,
+    JsonWithUnescapeBufferSize(request): JsonWithUnescapeBufferSize<TypeRequest, UNESCAPE_BUFFER>,
+) -> (StatusCode, &'static str) {
+    if !USB_CONFIGURED.load(Ordering::Relaxed) {
+        return (StatusCode::new(409), "no USB host is connected\n");
+    }
+    let job = TypeJob {
+        text: request.text,
+        delay_ms: request.delay_ms.unwrap_or(15).clamp(1, 200),
+    };
+    match TYPE_QUEUE.try_send(job) {
+        Ok(()) => (StatusCode::new(202), "typing\n"),
+        Err(_) => (StatusCode::new(503), "still typing the previous text\n"),
+    }
+}
+
+async fn logs(_: Authorized) -> impl IntoResponse {
+    crate::logger::contents()
+}
+
+async fn bootloader(_: Authorized) -> StatusCode {
+    BOOTLOADER.signal(());
+    StatusCode::NO_CONTENT
+}
+
 fn app() -> Router<impl PathRouter> {
     Router::new()
         .route("/status", get(status))
         .route("/display", post(show_display).delete(clear_display))
+        .route("/keyboard/type", post(type_text))
+        .route("/logs", get(logs))
+        .route("/bootloader", post(bootloader))
 }
 
 /// Number of HTTP connections served at the same time.
