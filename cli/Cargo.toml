@@ -1,0 +1,9 @@
+[package]
+name = "remotectl"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+remotectl-shared = { path = "../shared" }
+clap = { version = "4", features = ["derive", "env"] }
+serialport = { version = "4", default-features = false }

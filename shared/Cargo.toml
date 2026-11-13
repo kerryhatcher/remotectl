@@ -1,0 +1,25 @@
+[package]
+name = "remotectl-shared"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chacha20poly1305 = { version = "0.10", default-features = false }
+ed25519-dalek = { version = "2", default-features = false }
+hmac = { version = "0.12", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+
+[features]
+radio = ["dep:lora-phy", "dep:embedded-hal", "dep:embedded-hal-async"]
+
+[dependencies.lora-phy]
+version = "3.0.1"
+optional = true
+
+[dependencies.embedded-hal]
+version = "1"
+optional = true
+
+[dependencies.embedded-hal-async]
+version = "1"
+optional = true

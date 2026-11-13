@@ -1,3 +1,6 @@
+> **Inactive:** The current LoRa HID firmware does not start Wi-Fi or this HTTP API.
+> This document describes the earlier Wi-Fi firmware retained in the repository.
+
 # REST API
 
 The firmware joins your Wi-Fi network as a station, gets an address by DHCP and serves
@@ -19,7 +22,7 @@ committed. Set them in the shell that runs `cargo`:
 export WIFI_SSID='my network'
 export WIFI_PASSWORD='my password'
 export API_TOKEN="$(openssl rand -hex 16)"   # note it down, you need it for every request
-cd firmware && cargo run
+cd firmware && cargo run -p xiao-firmware
 ```
 
 The build fails if any of the three is missing. Changing one triggers a rebuild.

@@ -1,0 +1,13 @@
+[workspace]
+resolver = "3"
+members = ["firmware", "heltec-firmware", "cli", "shared"]
+default-members = ["cli", "shared"]
+
+[profile.dev]
+opt-level = "s"
+
+[profile.release]
+codegen-units = 1
+debug = 2
+lto = "fat"
+opt-level = "s"

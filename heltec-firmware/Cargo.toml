@@ -1,0 +1,19 @@
+[package]
+name = "heltec-firmware"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+
+[dependencies]
+esp-hal = { version = "~1.2.2", features = ["esp32s3", "unstable"] }
+esp-println = { version = "0.18.0", features = ["esp32s3"] }
+esp-backtrace = { version = "0.20.0", features = ["esp32s3", "panic-handler", "println"] }
+esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32s3"] }
+remotectl-shared = { path = "../shared", features = ["radio"] }
+
+lora-phy = "3.0.1"
+embassy-executor = "0.10"
+embassy-time = "0.5"
+esp-rtos = { version = "0.4", features = ["embassy", "esp32s3"] }
+embedded-hal-bus = "0.3"
+ed25519-dalek = { version = "2", default-features = false }

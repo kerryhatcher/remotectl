@@ -26,8 +26,8 @@ Use a pointed tool such as a pen tip or paperclip for the buttons.
 
 ## espflash
 
-`cargo run` in `firmware/` runs `espflash flash --monitor --chip esp32s3` (set in
-`firmware/.cargo/config.toml`). Source `~/export-esp.sh` first.
+With the link keys exported, `cargo run -p xiao-firmware` in `firmware/` runs `espflash flash --monitor --chip esp32s3` (set in
+`firmware/.cargo/config.toml`). Build artifacts are stored under the workspace root `target/` directory. Source `~/export-esp.sh` first.
 
 ```
 espflash board-info             # check the connection
@@ -37,11 +37,11 @@ espflash erase-flash            # wipe flash (removes Meshtastic and its setting
 
 `espflash` asks to confirm the serial port and whether to remember it. The port is `/dev/ttyACM0`.
 
-## Flashing after the USB keyboard firmware
+## Legacy Wi-Fi firmware recovery
 
-The firmware uses the USB pins (GPIO19/20) as a USB device, which replaces the
-USB-Serial-JTAG port. So there is no `/dev/ttyACM0`, no serial console and no automatic
-reset from `espflash`. Options:
+The older HID firmware used the USB pins (GPIO19/20) as a USB device, replacing the
+USB-Serial-JTAG port. Those builds did not expose the current CDC recovery interface.
+The legacy network-based script below applies only to the old Wi-Fi firmware:
 
 - `firmware/flash.sh` builds, calls `POST /bootloader` (needs `DEVICE_IP` and `API_TOKEN`),
   waits for `/dev/ttyACM0` and retries `espflash flash --no-stub` up to 5 times. The ROM
@@ -58,3 +58,18 @@ reset from `espflash`. Options:
   while Meshtastic was running. The board re-enumerated but no flash happened.
 - 2026-10-30: USB HID keyboard firmware. `POST /bootloader` reaches download mode, but
   flashing through it failed on some attempts (stub: `MemData` timeout, no-stub: broken pipe).
+
+## USB-command recovery (experimental)
+
+The XIAO firmware source provides a composite USB HID and CDC interface. A host can send
+`BOOTLOADER` followed by a newline to its CDC port to request ROM download mode. To build
+and flash using this path, set `RECOVERY_PORT` to the XIAO application's CDC port and
+`ROM_PORT` to its ROM serial port, then run `firmware/flash-usb.sh`. The ports may differ.
+The current XIAO firmware must already include the CDC recovery interface for this to work.
+
+Source the link key file and the ESP toolchain environment before using either script.
+For the Heltec V3, set `PORT` to its CP2102 serial port and run
+`heltec-firmware/flash-usb.sh`; `espflash` requests bootloader mode through the USB serial
+bridge's reset lines. The Heltec auto-reset path has been verified by reflashing the connected board. The XIAO
+USB reset and one button-free flash succeeded, but later attempts returned a `FlashEnd` error
+and required a USB cable reconnection. Button-free reflashing is not yet reliable.

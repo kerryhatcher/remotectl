@@ -7,7 +7,7 @@ Device: **Seeed Studio XIAO ESP32S3 & Wio-SX1262 Meshtastic LoRa Dev Kit** (Amaz
 |------|----------|
 | [hardware.md](hardware.md) | Specs, buttons/LEDs, pin map (XIAO + Wio-SX1262 + SX1262 control pins), TFT display wiring |
 | [wio-sx1262-module.md](wio-sx1262-module.md) | SX1262 module facts that matter for firmware (RF switch, TCXO, limits) |
-| [api.md](api.md) | Wi-Fi REST API: build-time config, auth, endpoints |
+| [api.md](api.md) | Legacy Wi-Fi REST API (inactive in the current firmware) |
 | [flashing.md](flashing.md) | Entering the bootloader, `espflash` usage, restoring Meshtastic |
 | `pdfs/` | Vendor PDFs (see below) |
 | `images/` | Vendor diagrams (button locations, pin lists) |

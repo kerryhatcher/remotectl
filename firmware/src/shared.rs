@@ -8,8 +8,7 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use heapless::String;
 
-/// Longest message that can be shown on the display (3 lines of 20 characters).
-pub const MESSAGE_LEN: usize = 60;
+pub use remotectl_shared::{DISPLAY_MESSAGE_MAX as MESSAGE_LEN, KEYBOARD_TEXT_MAX as TYPE_MAX};
 
 /// Request from the REST API to change what the display shows.
 pub enum DisplayCmd {
@@ -46,9 +45,6 @@ pub static RSSI_DBM: AtomicI32 = AtomicI32::new(0);
 /// Number of authorized API requests served since boot.
 pub static REQUESTS: AtomicU32 = AtomicU32::new(0);
 
-/// Longest text accepted by one `POST /keyboard/type` request.
-pub const TYPE_MAX: usize = 256;
-
 /// Text for the USB keyboard to type.
 pub struct TypeJob {
     pub text: String<TYPE_MAX>,
@@ -58,6 +54,27 @@ pub struct TypeJob {
 
 /// One job at a time: the API answers 503 while the keyboard is still typing.
 pub static TYPE_QUEUE: embassy_sync::channel::Channel<CriticalSectionRawMutex, TypeJob, 1> =
+    embassy_sync::channel::Channel::new();
+
+/// Mouse button, as the bit it sets in the HID report.
+#[derive(Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MouseButton {
+    Left,
+    Right,
+    Middle,
+}
+
+/// Action for the USB mouse.
+pub enum MouseCmd {
+    /// Relative pointer movement in HID counts (the host applies its pointer acceleration).
+    Move { dx: i16, dy: i16 },
+    Click { button: MouseButton, double: bool },
+    Scroll { amount: i8 },
+}
+
+/// A few queued mouse actions; the API answers 503 when it is full.
+pub static MOUSE_QUEUE: embassy_sync::channel::Channel<CriticalSectionRawMutex, MouseCmd, 4> =
     embassy_sync::channel::Channel::new();
 
 /// True while a USB host has configured the device (keyboard is usable).

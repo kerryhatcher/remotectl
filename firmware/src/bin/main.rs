@@ -8,36 +8,29 @@
 #![deny(clippy::large_stack_frames)]
 
 use core::cell::RefCell;
-use core::fmt::Write;
 
 use embassy_executor::Spawner;
-use embassy_futures::select::{Either, select};
 use embassy_time::{Duration, Timer};
-use embedded_graphics::mono_font::ascii::{FONT_6X10, FONT_10X20};
-use embedded_graphics::mono_font::{MonoTextStyle, MonoTextStyleBuilder};
+use embedded_graphics::mono_font::MonoTextStyle;
+use embedded_graphics::mono_font::ascii::FONT_10X20;
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
-use embedded_graphics::primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Rectangle};
 use embedded_graphics::text::Text;
-use embedded_hal::spi::SpiDevice;
 use embedded_hal_bus::spi::RefCellDevice;
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::delay::Delay;
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig};
-use esp_hal::rng::Rng;
 use esp_hal::spi::Mode;
 use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
-use firmware::shared::{DISPLAY_CMD, DisplayCmd, MESSAGE_LEN, RADIO, RadioStatus};
-use firmware::{api, system, usb_hid, wifi};
-use heapless::String;
-use log::{error, info};
+use log::info;
 use mipidsi::Builder;
 use mipidsi::interface::SpiInterface;
 use mipidsi::models::ST7789;
 use mipidsi::options::{ColorInversion, Orientation, Rotation};
+use xiao_firmware::{system, usb_hid};
 
 extern crate alloc;
 
@@ -45,123 +38,11 @@ extern crate alloc;
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
 esp_bootloader_esp_idf::esp_app_desc!();
 
-// SX1262 opcodes
-const OP_GET_STATUS: u8 = 0xC0;
-const OP_READ_REGISTER: u8 = 0x1D;
-// LoRa sync word register (reset value 0x1424)
-const REG_SYNC_WORD_MSB: u16 = 0x0740;
-
-// Adafruit 1.14" 240x135 TFT (ST7789) sits in the middle of the controller's
-// 240x320 RAM. Offsets are for the native portrait orientation.
+// Adafruit 1.14-inch ST7789 panel, native portrait orientation.
 const DISPLAY_WIDTH: u16 = 135;
 const DISPLAY_HEIGHT: u16 = 240;
 const DISPLAY_OFFSET_X: u16 = 52;
 const DISPLAY_OFFSET_Y: u16 = 40;
-
-async fn wait_busy_low(busy: &Input<'_>) -> bool {
-    for _ in 0..100 {
-        if busy.is_low() {
-            return true;
-        }
-        Timer::after(Duration::from_millis(1)).await;
-    }
-    false
-}
-
-/// Result of one radio check, shown on the display.
-enum RadioCheck {
-    Ok { status: u8, sync: u16 },
-    BadSync { status: u8, sync: u16 },
-    BusyStuck,
-    SpiError,
-}
-
-fn draw_frame<D>(
-    display: &mut D,
-    check: &RadioCheck,
-    tick: u32,
-    message: &str,
-) -> Result<(), D::Error>
-where
-    D: DrawTarget<Color = Rgb565>,
-{
-    let size = display.bounding_box().size;
-
-    // Border exactly at the panel edge: if it is clipped or offset, the
-    // DISPLAY_OFFSET_* constants need adjusting.
-    Rectangle::new(Point::zero(), size)
-        .into_styled(PrimitiveStyle::with_stroke(Rgb565::WHITE, 1))
-        .draw(display)?;
-
-    let title = MonoTextStyle::new(&FONT_10X20, Rgb565::CYAN);
-    Text::new("XIAO", Point::new(10, 28), title).draw(display)?;
-    Text::new("ESP32-S3", Point::new(10, 52), title).draw(display)?;
-
-    // Background color overwrites the previous frame's text without clearing.
-    let line = |color| {
-        MonoTextStyleBuilder::new()
-            .font(&FONT_10X20)
-            .text_color(color)
-            .background_color(Rgb565::BLACK)
-            .build()
-    };
-    let small = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
-        .text_color(Rgb565::WHITE)
-        .background_color(Rgb565::BLACK)
-        .build();
-
-    // Portrait is 135 px wide: 12 chars of the 10x20 font, 20 of the 6x10 font.
-    let mut text: String<32> = String::new();
-    let (label, color) = match check {
-        RadioCheck::Ok { .. } => ("OK          ", Rgb565::GREEN),
-        RadioCheck::BadSync { .. } => ("BAD SYNC    ", Rgb565::YELLOW),
-        RadioCheck::BusyStuck => ("BUSY HIGH   ", Rgb565::RED),
-        RadioCheck::SpiError => ("SPI ERROR   ", Rgb565::RED),
-    };
-    Text::new("SX1262", Point::new(10, 90), line(Rgb565::WHITE)).draw(display)?;
-    Text::new(label, Point::new(10, 114), line(color)).draw(display)?;
-
-    match check {
-        RadioCheck::Ok { status, sync } | RadioCheck::BadSync { status, sync } => {
-            let _ = write!(text, "status 0x{status:02X}      ");
-            Text::new(&text, Point::new(10, 140), small).draw(display)?;
-            text.clear();
-            let _ = write!(text, "sync   0x{sync:04X}    ");
-            Text::new(&text, Point::new(10, 152), small).draw(display)?;
-        }
-        _ => {
-            Text::new("no response        ", Point::new(10, 140), small).draw(display)?;
-            Text::new("                   ", Point::new(10, 152), small).draw(display)?;
-        }
-    }
-
-    text.clear();
-    let _ = write!(text, "check #{tick}      ");
-    Text::new(&text, Point::new(10, 164), small).draw(display)?;
-
-    // Message from the REST API: up to 3 lines of 20 characters, padded so a
-    // shorter message overwrites the previous one.
-    for (i, y) in [182, 194, 206].into_iter().enumerate() {
-        let chunk = message
-            .get(i * 20..)
-            .map_or("", |rest| &rest[..rest.len().min(20)]);
-        text.clear();
-        let _ = write!(text, "{chunk:<20}");
-        Text::new(&text, Point::new(10, y), small).draw(display)?;
-    }
-
-    // Color bars: red, green, blue. Wrong order or inverted colors show here.
-    let bar = |x, color| {
-        Rectangle::new(Point::new(x, 216), Size::new(35, 20))
-            .into_styled(PrimitiveStyleBuilder::new().fill_color(color).build())
-    };
-    bar(8, Rgb565::RED).draw(display)?;
-    bar(50, Rgb565::GREEN).draw(display)?;
-    bar(92, Rgb565::BLUE).draw(display)?;
-
-    Ok(())
-}
 
 #[allow(
     clippy::large_stack_frames,
@@ -169,8 +50,8 @@ where
 )]
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
-    // No USB serial console (the USB port is a keyboard): logs go to a RAM buffer, see GET /logs.
-    firmware::logger::init(log::LevelFilter::Info);
+    // USB CDC is reserved for recovery; logs go to a RAM buffer, see GET /logs.
+    xiao_firmware::logger::init(log::LevelFilter::Info);
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
@@ -182,14 +63,10 @@ async fn main(spawner: Spawner) -> ! {
 
     info!("Embassy initialized!");
 
-    // Wi-Fi + REST API. Credentials and the API token are compiled in.
-    let rng = Rng::new();
-    let seed = (u64::from(rng.random()) << 32) | u64::from(rng.random());
-    let stack = wifi::start(&spawner, peripherals.WIFI, seed);
-    for id in 0..api::WEB_TASKS {
-        spawner.spawn(api::web_task(id, stack).expect("web task"));
-    }
-
+    // Reserve the ADC entropy source for cryptographic challenges. Wi-Fi is disabled
+    // while operating as a LoRa HID receiver.
+    let _entropy = esp_hal::rng::TrngSource::new(peripherals.RNG, peripherals.ADC1);
+    let trng = esp_hal::rng::Trng::try_new().expect("TRNG source");
     usb_hid::start(
         &spawner,
         peripherals.USB_FS,
@@ -198,32 +75,26 @@ async fn main(spawner: Spawner) -> ! {
     );
     spawner.spawn(system::bootloader_task().expect("bootloader task"));
 
-    // Wio-SX1262 on XIAO ESP32S3
     let nss = Output::new(peripherals.GPIO41, Level::High, OutputConfig::default());
-    let mut reset = Output::new(peripherals.GPIO42, Level::High, OutputConfig::default());
+    let reset = Output::new(peripherals.GPIO42, Level::High, OutputConfig::default());
     let busy = Input::new(peripherals.GPIO40, InputConfig::default());
-
-    // Display: Adafruit 1.14" TFT. CL=D8(SCK), DA=D10(MOSI), CS=D6, DC=D7
+    let irq = Input::new(peripherals.GPIO39, InputConfig::default());
+    let rxen = Output::new(peripherals.GPIO38, Level::Low, OutputConfig::default());
     let display_cs = Output::new(peripherals.GPIO43, Level::High, OutputConfig::default());
     let display_dc = Output::new(peripherals.GPIO44, Level::Low, OutputConfig::default());
-
-    // One SPI bus shared by the radio and the display, each with its own CS.
-    // 10 MHz is within both the SX1262 (16 MHz max) and the ST7789 limits.
     let spi = Spi::new(
         peripherals.SPI2,
         SpiConfig::default()
             .with_frequency(Rate::from_mhz(10))
             .with_mode(Mode::_0),
     )
-    .expect("spi config")
+    .expect("SPI config")
     .with_sck(peripherals.GPIO7)
     .with_miso(peripherals.GPIO8)
     .with_mosi(peripherals.GPIO9);
     let spi_bus = RefCell::new(spi);
-
-    let mut radio = RefCellDevice::new(&spi_bus, nss, Delay::new()).expect("radio cs");
+    let radio_dev = RefCellDevice::new(&spi_bus, nss, Delay::new()).expect("radio cs");
     let display_spi = RefCellDevice::new(&spi_bus, display_cs, Delay::new()).expect("display cs");
-
     let mut display_buf = [0u8; 512];
     let di = SpiInterface::new(display_spi, display_dc, &mut display_buf);
     let mut display = Builder::new(ST7789, di)
@@ -233,116 +104,112 @@ async fn main(spawner: Spawner) -> ! {
         .invert_colors(ColorInversion::Inverted)
         .init(&mut Delay::new())
         .expect("display init");
-    display.clear(Rgb565::BLACK).expect("display clear");
-    info!("Display initialized");
+    let _ = display.clear(Rgb565::BLACK);
+    let label = MonoTextStyle::new(&FONT_10X20, Rgb565::CYAN);
+    let _ = Text::new("LoRa HID", Point::new(10, 28), label).draw(&mut display);
+    let _ = Text::new("receiver", Point::new(10, 52), label).draw(&mut display);
 
-    let mut tick: u32 = 0;
-    let mut message: String<MESSAGE_LEN> = String::new();
-    let mut check = RadioCheck::BusyStuck;
-    let mut run_check = true;
+    let iv = lora_phy::iv::GenericSx126xInterfaceVariant::new(reset, irq, busy, Some(rxen), None)
+        .expect("radio pins");
+    let config = lora_phy::sx126x::Config {
+        chip: lora_phy::sx126x::Sx1262,
+        tcxo_ctrl: Some(lora_phy::sx126x::TcxoCtrlVoltage::Ctrl1V8),
+        use_dcdc: true,
+        rx_boost: false,
+    };
+    let mut radio = lora_phy::LoRa::new(
+        lora_phy::sx126x::Sx126x::new(remotectl_shared::radio::BlockingSpi(radio_dev), iv, config),
+        false,
+        embassy_time::Delay,
+    )
+    .await
+    .expect("radio init");
+    let key = remotectl_shared::parse_key(env!("REMOTECTL_LINK_KEY"));
+    let verifying = remotectl_shared::parse_key(env!("REMOTECTL_VERIFY_KEY"))
+        .and_then(|key| ed25519_dalek::VerifyingKey::from_bytes(&key).ok());
+    let mut session: Option<remotectl_shared::secure::Receiver> = None;
+    let mut active_challenge: Option<[u8; 16]> = None;
+    let mut buffer = [0u8; remotectl_shared::radio::MAX_FRAME];
     loop {
-        if run_check {
-            tick += 1;
-
-            // Hardware reset
-            reset.set_low();
-            Timer::after(Duration::from_millis(5)).await;
-            reset.set_high();
-            Timer::after(Duration::from_millis(10)).await;
-
-            check = if !wait_busy_low(&busy).await {
-                error!("BUSY stuck high after reset (check wiring/pins)");
-                RadioCheck::BusyStuck
-            } else {
-                // GetStatus: opcode, then one status byte
-                let mut status = [OP_GET_STATUS, 0x00];
-                match radio.transfer_in_place(&mut status) {
-                    Ok(()) => info!(
-                        "GetStatus -> 0x{:02X} (chip mode {}, cmd status {})",
-                        status[1],
-                        (status[1] >> 4) & 0x7,
-                        (status[1] >> 1) & 0x7
-                    ),
-                    Err(e) => error!("GetStatus SPI error: {:?}", e),
-                }
-
-                wait_busy_low(&busy).await;
-
-                // ReadRegister: opcode, addr hi, addr lo, NOP/status, then data bytes
-                let [hi, lo] = REG_SYNC_WORD_MSB.to_be_bytes();
-                let mut buf = [OP_READ_REGISTER, hi, lo, 0x00, 0x00, 0x00];
-                match radio.transfer_in_place(&mut buf) {
-                    Ok(()) => {
-                        let sync = u16::from_be_bytes([buf[4], buf[5]]);
-                        if sync == 0x1424 {
-                            info!("Sync word reg = 0x{sync:04X} (expected 0x1424) -> SX1262 OK");
-                            RadioCheck::Ok {
-                                status: status[1],
-                                sync,
-                            }
-                        } else {
-                            error!("Sync word reg = 0x{sync:04X} (expected 0x1424)");
-                            RadioCheck::BadSync {
-                                status: status[1],
-                                sync,
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("ReadRegister SPI error: {:?}", e);
-                        RadioCheck::SpiError
-                    }
-                }
-            };
-
-            RADIO.lock(|cell| {
-                *cell.borrow_mut() = match check {
-                    RadioCheck::Ok { status, sync } => RadioStatus {
-                        ok: true,
-                        checks: tick,
-                        status_byte: status,
-                        sync_word: sync,
-                    },
-                    RadioCheck::BadSync { status, sync } => RadioStatus {
-                        ok: false,
-                        checks: tick,
-                        status_byte: status,
-                        sync_word: sync,
-                    },
-                    RadioCheck::BusyStuck | RadioCheck::SpiError => RadioStatus {
-                        ok: false,
-                        checks: tick,
-                        status_byte: 0,
-                        sync_word: 0,
-                    },
-                };
-            });
+        let Ok(len) = remotectl_shared::radio::receive(&mut radio, &mut buffer).await else {
+            continue;
+        };
+        if &buffer[..len] == remotectl_shared::radio::HELLO {
+            if key.is_none() || verifying.is_none() {
+                continue;
+            }
+            let mut challenge = [0u8; 16];
+            trng.read(&mut challenge);
+            session = Some(remotectl_shared::secure::Receiver::new(challenge));
+            active_challenge = Some(challenge);
+            let prefix = remotectl_shared::radio::CHALLENGE_PREFIX;
+            let mut reply = [0u8; 64];
+            reply[..prefix.len()].copy_from_slice(prefix);
+            reply[prefix.len()..prefix.len() + 16].copy_from_slice(&challenge);
+            Timer::after(Duration::from_millis(200)).await;
+            let _ = remotectl_shared::radio::send(&mut radio, &reply[..prefix.len() + 16]).await;
+            continue;
         }
-
-        if let Err(e) = draw_frame(&mut display, &check, tick, &message) {
-            error!("Display draw error: {:?}", e);
-        }
-
-        // Re-check the radio every 2 s, or redraw right away when the API changes the message.
-        match select(Timer::after(Duration::from_secs(2)), DISPLAY_CMD.wait()).await {
-            Either::First(()) => run_check = true,
-            Either::Second(DisplayCmd::Show(text)) => {
-                message.clear();
-                // The display font is ASCII only.
-                for c in text.chars() {
-                    let _ = message.push(if c.is_ascii_graphic() || c == ' ' {
-                        c
+        let (Some(session), Some(key), Some(verifying)) = (&mut session, &key, &verifying) else {
+            continue;
+        };
+        let mut plaintext = [0u8; 123];
+        let Ok(command) = session.open(key, verifying, &buffer[..len], &mut plaintext) else {
+            continue;
+        };
+        use remotectl_shared::{InputCommand, MouseButton};
+        use xiao_firmware::shared::{
+            MOUSE_QUEUE, MouseButton as HidButton, MouseCmd, TYPE_QUEUE, TypeJob,
+        };
+        let connected =
+            xiao_firmware::shared::USB_CONFIGURED.load(core::sync::atomic::Ordering::Relaxed);
+        let status = match command {
+            InputCommand::Ping => 0,
+            _ if !connected => 5,
+            InputCommand::Type { text, delay_ms } => match heapless::String::try_from(text) {
+                Ok(text) => {
+                    if TYPE_QUEUE.try_send(TypeJob { text, delay_ms }).is_ok() {
+                        0
                     } else {
-                        '?'
-                    });
+                        6
+                    }
                 }
-                info!("Display message: {}", message.as_str());
-                run_check = false;
+                Err(_) => 6,
+            },
+            InputCommand::Move { dx, dy } => {
+                if MOUSE_QUEUE.try_send(MouseCmd::Move { dx, dy }).is_ok() {
+                    0
+                } else {
+                    6
+                }
             }
-            Either::Second(DisplayCmd::Clear) => {
-                message.clear();
-                run_check = false;
+            InputCommand::Click { button, double } => {
+                let button = match button {
+                    MouseButton::Left => HidButton::Left,
+                    MouseButton::Right => HidButton::Right,
+                    MouseButton::Middle => HidButton::Middle,
+                };
+                if MOUSE_QUEUE
+                    .try_send(MouseCmd::Click { button, double })
+                    .is_ok()
+                {
+                    0
+                } else {
+                    6
+                }
             }
+            InputCommand::Scroll { amount } => {
+                if MOUSE_QUEUE.try_send(MouseCmd::Scroll { amount }).is_ok() {
+                    0
+                } else {
+                    6
+                }
+            }
+        };
+        if let Some(challenge) = active_challenge {
+            let ack = remotectl_shared::secure::make_ack(key, &challenge, status);
+            Timer::after(Duration::from_millis(200)).await;
+            let _ = remotectl_shared::radio::send(&mut radio, &ack).await;
         }
     }
 }

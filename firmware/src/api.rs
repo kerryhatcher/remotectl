@@ -7,6 +7,7 @@
 //! | DELETE | `/display` | -                   | Clears the text                  |
 //! | POST   | `/keyboard/type` | `{"text": "...", "delay_ms": 15}` | Types the text on the USB host |
 //! | GET    | `/logs`    | -                   | Recent log lines as plain text   |
+//! | POST   | `/mouse/move`, `/mouse/click`, `/mouse/scroll` | - | Moves, clicks or scrolls the USB mouse |
 //! | POST   | `/bootloader` | -                | Reboots into the ROM download mode |
 //!
 //! Every route needs the header `Authorization: Bearer <API_TOKEN>`.
@@ -25,8 +26,8 @@ use picoserve::{Config, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::shared::{
-    BOOTLOADER, DISPLAY_CMD, DisplayCmd, IP_ADDR, MESSAGE_LEN, RADIO, REQUESTS, RSSI_DBM, TYPE_MAX,
-    TYPE_QUEUE, TypeJob, USB_CONFIGURED,
+    BOOTLOADER, DISPLAY_CMD, DisplayCmd, IP_ADDR, MESSAGE_LEN, MOUSE_QUEUE, MouseButton, MouseCmd,
+    RADIO, REQUESTS, RSSI_DBM, TYPE_MAX, TYPE_QUEUE, TypeJob, USB_CONFIGURED,
 };
 
 // Set at build time, e.g. `API_TOKEN=$(openssl rand -hex 16) cargo run`.
@@ -175,6 +176,64 @@ async fn type_text(
     }
 }
 
+#[derive(Deserialize)]
+struct MoveRequest {
+    dx: i16,
+    dy: i16,
+}
+
+#[derive(Deserialize)]
+struct ClickRequest {
+    button: MouseButton,
+    #[serde(default)]
+    double: bool,
+}
+
+#[derive(Deserialize)]
+struct ScrollRequest {
+    amount: i8,
+}
+
+/// Queue a mouse action: 409 without a USB host, 503 while earlier actions are pending.
+fn queue_mouse(cmd: MouseCmd) -> (StatusCode, &'static str) {
+    if !USB_CONFIGURED.load(Ordering::Relaxed) {
+        return (StatusCode::new(409), "no USB host is connected\n");
+    }
+    match MOUSE_QUEUE.try_send(cmd) {
+        Ok(()) => (StatusCode::new(202), "queued\n"),
+        Err(_) => (StatusCode::new(503), "mouse queue is full\n"),
+    }
+}
+
+async fn mouse_move(
+    _: Authorized,
+    picoserve::extract::Json(request): picoserve::extract::Json<MoveRequest>,
+) -> (StatusCode, &'static str) {
+    queue_mouse(MouseCmd::Move {
+        dx: request.dx,
+        dy: request.dy,
+    })
+}
+
+async fn mouse_click(
+    _: Authorized,
+    picoserve::extract::Json(request): picoserve::extract::Json<ClickRequest>,
+) -> (StatusCode, &'static str) {
+    queue_mouse(MouseCmd::Click {
+        button: request.button,
+        double: request.double,
+    })
+}
+
+async fn mouse_scroll(
+    _: Authorized,
+    picoserve::extract::Json(request): picoserve::extract::Json<ScrollRequest>,
+) -> (StatusCode, &'static str) {
+    queue_mouse(MouseCmd::Scroll {
+        amount: request.amount,
+    })
+}
+
 async fn logs(_: Authorized) -> impl IntoResponse {
     crate::logger::contents()
 }
@@ -189,6 +248,9 @@ fn app() -> Router<impl PathRouter> {
         .route("/status", get(status))
         .route("/display", post(show_display).delete(clear_display))
         .route("/keyboard/type", post(type_text))
+        .route("/mouse/move", post(mouse_move))
+        .route("/mouse/click", post(mouse_click))
+        .route("/mouse/scroll", post(mouse_scroll))
         .route("/logs", get(logs))
         .route("/bootloader", post(bootloader))
 }

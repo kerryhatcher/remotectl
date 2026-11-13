@@ -9,16 +9,16 @@
 #
 # Needs WIFI_SSID, WIFI_PASSWORD and API_TOKEN in the environment (same as `cargo build`).
 # If the board is not reachable over Wi-Fi, hold B on the XIAO while plugging it in and
-# run `espflash flash --chip esp32s3 target/xtensa-esp32s3-none-elf/debug/firmware`.
+# run `espflash flash --chip esp32s3 ../target/xtensa-esp32s3-none-elf/debug/firmware`.
 set -euo pipefail
 cd "$(dirname "$0")"
 
-: "${DEVICE_IP:?set DEVICE_IP to the board's address}"
+: "${DEVICE_IP:?set DEVICE_IP to the board address}"
 : "${API_TOKEN:?set API_TOKEN}"
 PORT="${PORT:-/dev/ttyACM0}"
-BIN=target/xtensa-esp32s3-none-elf/debug/firmware
+BIN=../target/xtensa-esp32s3-none-elf/debug/firmware
 
-cargo build
+cargo build -p xiao-firmware
 
 for attempt in 1 2 3 4 5; do
     echo "== attempt $attempt: rebooting into download mode"
