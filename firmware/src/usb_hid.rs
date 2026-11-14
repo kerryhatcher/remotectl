@@ -7,7 +7,8 @@
 use core::sync::atomic::Ordering;
 
 use embassy_executor::Spawner;
-use embassy_time::{Duration, Timer};
+use embassy_futures::select::{Either, select};
+use embassy_time::{Duration, Timer, with_timeout};
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State as CdcState};
 use embassy_usb::class::hid::{
     Config as HidConfig, HidBootProtocol, HidSubclass, HidWriter, State,
@@ -19,7 +20,11 @@ use esp_hal::usb::otg::embassy_usb_device::{Config as DriverConfig, Driver};
 use log::{info, warn};
 use static_cell::StaticCell;
 
-use crate::shared::{BOOTLOADER, MOUSE_QUEUE, MouseButton, MouseCmd, TYPE_QUEUE, USB_CONFIGURED};
+use crate::shared::{
+    BOOTLOADER, KEYBOARD_USB_EVENT, MEDIA_QUEUE, MOUSE_QUEUE, MOUSE_USB_EVENT, MouseButton,
+    MouseCmd, Pending, TYPE_QUEUE, TypeJob, USB_CONFIGURED, USB_SUSPENDED, invalidate_input,
+    notify_input_resume, usb_input_epoch,
+};
 
 const SHIFT: u8 = 0x02;
 
@@ -51,10 +56,10 @@ const KEYBOARD_REPORT_DESCRIPTOR: &[u8] = &[
     0x95, 0x06, //   Report Count (6)
     0x75, 0x08, //   Report Size (8)
     0x15, 0x00, //   Logical Minimum (0)
-    0x25, 0x65, //   Logical Maximum (101)
+    0x26, 0xFF, 0x00, //   Logical Maximum (255)
     0x05, 0x07, //   Usage Page (Keyboard)
     0x19, 0x00, //   Usage Minimum (0)
-    0x29, 0x65, //   Usage Maximum (101)
+    0x2A, 0xFF, 0x00, //   Usage Maximum (255)
     0x81, 0x00, //   Input (Data, Array): key codes
     0xC0, // End Collection
 ];
@@ -64,6 +69,7 @@ const MOUSE_REPORT_DESCRIPTOR: &[u8] = &[
     0x05, 0x01, // Usage Page (Generic Desktop)
     0x09, 0x02, // Usage (Mouse)
     0xA1, 0x01, // Collection (Application)
+    0x85, 0x01, // Report ID 1: mouse
     0x09, 0x01, //   Usage (Pointer)
     0xA1, 0x00, //   Collection (Physical)
     0x05, 0x09, //     Usage Page (Buttons)
@@ -88,6 +94,12 @@ const MOUSE_REPORT_DESCRIPTOR: &[u8] = &[
     0x81, 0x06, //     Input (Data, Variable, Relative): X, Y, wheel
     0xC0, //   End Collection
     0xC0, // End Collection
+    0x05, 0x0C, 0x09, 0x01, 0xA1, 0x01, // Consumer Control application
+    0x85, 0x02, // Report ID 2: consumer key
+    0x15, 0x00, 0x26, 0xFF, 0x03, // Logical range 0..1023
+    0x19, 0x00, 0x2A, 0xFF, 0x03, // Usage range 0..1023
+    0x75, 0x10, 0x95, 0x01, 0x81, 0x00, // One 16-bit array entry
+    0xC0,
 ];
 
 /// Modifier byte and usage code for a character on a US keyboard layout.
@@ -141,7 +153,13 @@ struct ConnectionHandler;
 
 impl Handler for ConnectionHandler {
     fn configured(&mut self, configured: bool) {
-        USB_CONFIGURED.store(configured, Ordering::Relaxed);
+        USB_CONFIGURED.store(configured, Ordering::SeqCst);
+        if configured {
+            USB_SUSPENDED.store(false, Ordering::SeqCst);
+            notify_input_resume();
+        } else {
+            invalidate_input();
+        }
         info!(
             "USB host {}",
             if configured {
@@ -153,10 +171,17 @@ impl Handler for ConnectionHandler {
     }
 
     fn reset(&mut self) {
-        USB_CONFIGURED.store(false, Ordering::Relaxed);
+        USB_CONFIGURED.store(false, Ordering::SeqCst);
+        invalidate_input();
     }
 
     fn suspended(&mut self, suspended: bool) {
+        USB_SUSPENDED.store(suspended, Ordering::SeqCst);
+        if suspended {
+            invalidate_input();
+        } else {
+            notify_input_resume();
+        }
         info!("USB {}", if suspended { "suspended" } else { "resumed" });
     }
 }
@@ -206,16 +231,16 @@ pub fn start(spawner: &Spawner, usb: USB_FS<'static>, dp: GPIO20<'static>, dm: G
         },
     );
 
-    let mouse_writer = HidWriter::<_, 4>::new(
+    let mouse_writer = HidWriter::<_, 5>::new(
         &mut builder,
         MOUSE_STATE.init(State::new()),
         HidConfig {
             report_descriptor: MOUSE_REPORT_DESCRIPTOR,
             request_handler: None,
             poll_ms: 10,
-            max_packet_size: 4,
-            hid_subclass: HidSubclass::Boot,
-            hid_boot_protocol: HidBootProtocol::Mouse,
+            max_packet_size: 5,
+            hid_subclass: HidSubclass::No,
+            hid_boot_protocol: HidBootProtocol::None,
         },
     );
 
@@ -231,41 +256,155 @@ async fn usb_task(mut device: UsbDevice<'static, Driver<'static>>) -> ! {
     device.run().await
 }
 
+/// Clear a potentially pressed key without allowing a sleeping host to block us.
+async fn keyboard_neutral(writer: &mut HidWriter<'static, Driver<'static>, 8>) {
+    if usb_input_epoch().is_some() {
+        let _ = with_timeout(Duration::from_millis(100), async {
+            writer.ready().await;
+            if usb_input_epoch().is_some() {
+                let _ = writer.write(&[0; 8]).await;
+            }
+        })
+        .await;
+    }
+}
+
 #[embassy_executor::task]
 async fn keyboard_task(mut writer: HidWriter<'static, Driver<'static>, 8>) {
     loop {
-        let job = TYPE_QUEUE.receive().await;
-        let pause = Duration::from_millis(u64::from(job.delay_ms));
-        info!("Typing {} characters", job.text.chars().count());
-
-        writer.ready().await;
-        let mut skipped = 0;
-        for c in job.text.chars() {
-            if c == '\r' {
-                continue; // CRLF: the \n types the Enter key
-            }
-            let Some((modifier, usage)) = key_for(c) else {
-                skipped += 1;
+        let pending = match select(TYPE_QUEUE.receive(), KEYBOARD_USB_EVENT.wait()).await {
+            Either::First(pending) => pending,
+            Either::Second(()) => {
+                keyboard_neutral(&mut writer).await;
                 continue;
+            }
+        };
+        KEYBOARD_USB_EVENT.reset();
+        if !pending.is_current() {
+            keyboard_neutral(&mut writer).await;
+            continue;
+        }
+        let deadline = pending.deadline();
+        keyboard_neutral(&mut writer).await;
+        if !pending.is_current() {
+            keyboard_neutral(&mut writer).await;
+            continue;
+        }
+        let completed = remotectl_shared::input_expiry::run_until_invalid(
+            KEYBOARD_USB_EVENT.wait(),
+            Timer::at(deadline),
+            execute_keyboard(&mut writer, pending.action),
+        )
+        .await;
+        if !completed {
+            warn!("Keyboard action expired or USB session changed");
+            keyboard_neutral(&mut writer).await;
+        }
+    }
+}
+
+async fn execute_keyboard(writer: &mut HidWriter<'static, Driver<'static>, 8>, job: TypeJob) {
+    let pause = Duration::from_millis(u64::from(job.delay_ms));
+    info!("Typing {} characters", job.text.chars().count());
+
+    writer.ready().await;
+    if let Some((host, scalar)) = job.unicode {
+        // Linux: Ctrl+Shift+U, hexadecimal scalar, Enter. macOS: hold Option
+        // while typing exactly four hex digits with Unicode Hex Input active.
+        let mut digits = [0u8; 8];
+        let mut value = scalar;
+        let mut start = digits.len();
+        loop {
+            start -= 1;
+            let digit = (value & 15) as u8;
+            digits[start] = if digit < 10 {
+                b'0' + digit
+            } else {
+                b'a' + digit - 10
             };
+            value >>= 4;
+            if value == 0 && (host == 1 || digits.len() - start >= 4) {
+                break;
+            }
+        }
+        if host == 1 {
+            let _ = writer.write(&[0x03, 0, 0x18, 0, 0, 0, 0, 0]).await;
+            Timer::after(pause).await;
+            let _ = writer.write(&[0; 8]).await;
+            Timer::after(pause).await;
+        }
+        let modifier = if host == 2 { 0x04 } else { 0 };
+        for digit in &digits[start..] {
+            let (_, usage) = key_for(*digit as char).expect("hex digit mapping");
             if writer
                 .write(&[modifier, 0, usage, 0, 0, 0, 0, 0])
                 .await
                 .is_err()
             {
-                warn!("USB write failed, dropping the rest of the text");
                 break;
             }
             Timer::after(pause).await;
-            if writer.write(&[0; 8]).await.is_err() {
+            if writer
+                .write(&[modifier, 0, 0, 0, 0, 0, 0, 0])
+                .await
+                .is_err()
+            {
                 break;
             }
             Timer::after(pause).await;
         }
-        let _ = writer.write(&[0; 8]).await; // make sure no key stays pressed
-        if skipped > 0 {
-            warn!("Skipped {skipped} characters with no US keyboard mapping");
+        if host == 1 {
+            let _ = writer.write(&[0, 0, 0x28, 0, 0, 0, 0, 0]).await;
+            Timer::after(pause).await;
         }
+        let _ = writer.write(&[0; 8]).await;
+        return;
+    }
+    if let Some((modifiers, keys)) = job.chord {
+        let mut report = [0u8; 8];
+        report[0] = modifiers;
+        report[2..].copy_from_slice(&keys);
+        if writer.write(&report).await.is_ok() {
+            Timer::after(pause).await;
+        }
+        let _ = writer.write(&[0; 8]).await;
+        return;
+    }
+    let mut skipped = 0;
+    let mut write_failed = false;
+    for c in job.text.chars() {
+        if c == '\r' {
+            continue; // CRLF: the \n types the Enter key
+        }
+        let Some((modifier, usage)) = key_for(c) else {
+            skipped += 1;
+            continue;
+        };
+        if writer
+            .write(&[modifier, 0, usage, 0, 0, 0, 0, 0])
+            .await
+            .is_err()
+        {
+            warn!("USB write failed, dropping the rest of the text");
+            write_failed = true;
+            break;
+        }
+        Timer::after(pause).await;
+        if writer.write(&[0; 8]).await.is_err() {
+            write_failed = true;
+            break;
+        }
+        Timer::after(pause).await;
+    }
+    if job.command_return && !write_failed && skipped == 0 {
+        // Left GUI (Command on macOS) + Enter, followed by a full release.
+        if writer.write(&[0x08, 0, 0x28, 0, 0, 0, 0, 0]).await.is_ok() {
+            Timer::after(pause).await;
+        }
+    }
+    let _ = writer.write(&[0; 8]).await; // make sure no key stays pressed
+    if skipped > 0 {
+        warn!("Skipped {skipped} characters with no US keyboard mapping");
     }
 }
 
@@ -301,62 +440,138 @@ const MOUSE_STEP: i16 = 127;
 const MOUSE_PAUSE: Duration = Duration::from_millis(10);
 
 async fn mouse_report(
-    writer: &mut HidWriter<'static, Driver<'static>, 4>,
+    writer: &mut HidWriter<'static, Driver<'static>, 5>,
     buttons: u8,
     dx: i8,
     dy: i8,
     wheel: i8,
 ) -> bool {
     writer
-        .write(&[buttons, dx as u8, dy as u8, wheel as u8])
+        .write(&[1, buttons, dx as u8, dy as u8, wheel as u8])
         .await
         .is_ok()
 }
 
-async fn mouse_click(writer: &mut HidWriter<'static, Driver<'static>, 4>, button: u8) -> bool {
+async fn mouse_click(writer: &mut HidWriter<'static, Driver<'static>, 5>, button: u8) -> bool {
     mouse_report(writer, button, 0, 0, 0).await && {
         Timer::after(Duration::from_millis(40)).await;
         mouse_report(writer, 0, 0, 0, 0).await
     }
 }
 
+enum PointerAction {
+    Mouse(MouseCmd),
+    Media(u16),
+}
+
+async fn mouse_neutral(writer: &mut HidWriter<'static, Driver<'static>, 5>) {
+    if usb_input_epoch().is_some() {
+        let _ = with_timeout(Duration::from_millis(100), async {
+            writer.ready().await;
+            if usb_input_epoch().is_some() {
+                let _ = writer.write(&[1, 0, 0, 0, 0]).await;
+                let _ = writer.write(&[2, 0, 0]).await;
+            }
+        })
+        .await;
+    }
+}
+
 #[embassy_executor::task]
-async fn mouse_task(mut writer: HidWriter<'static, Driver<'static>, 4>) {
+async fn mouse_task(mut writer: HidWriter<'static, Driver<'static>, 5>) {
     loop {
-        let cmd = MOUSE_QUEUE.receive().await;
-        writer.ready().await;
-        let ok = match cmd {
-            MouseCmd::Move { mut dx, mut dy } => {
-                let mut ok = true;
-                while ok && (dx != 0 || dy != 0) {
-                    let (sx, sy) = (
-                        dx.clamp(-MOUSE_STEP, MOUSE_STEP),
-                        dy.clamp(-MOUSE_STEP, MOUSE_STEP),
-                    );
-                    ok = mouse_report(&mut writer, 0, sx as i8, sy as i8, 0).await;
-                    dx -= sx;
-                    dy -= sy;
-                    Timer::after(MOUSE_PAUSE).await;
-                }
-                ok
+        let pending = match select(
+            select(MOUSE_QUEUE.receive(), MEDIA_QUEUE.receive()),
+            MOUSE_USB_EVENT.wait(),
+        )
+        .await
+        {
+            Either::First(Either::First(job)) => Pending {
+                action: PointerAction::Mouse(job.action),
+                epoch: job.epoch,
+                accepted: job.accepted,
+            },
+            Either::First(Either::Second(job)) => Pending {
+                action: PointerAction::Media(job.action),
+                epoch: job.epoch,
+                accepted: job.accepted,
+            },
+            Either::Second(()) => {
+                mouse_neutral(&mut writer).await;
+                continue;
             }
-            MouseCmd::Click { button, double } => {
-                let bit = match button {
-                    MouseButton::Left => 0x01,
-                    MouseButton::Right => 0x02,
-                    MouseButton::Middle => 0x04,
-                };
-                let mut ok = mouse_click(&mut writer, bit).await;
-                if ok && double {
-                    Timer::after(Duration::from_millis(60)).await;
-                    ok = mouse_click(&mut writer, bit).await;
-                }
-                ok
-            }
-            MouseCmd::Scroll { amount } => mouse_report(&mut writer, 0, 0, 0, amount).await,
         };
-        if !ok {
-            warn!("USB mouse write failed, dropping the action");
+        MOUSE_USB_EVENT.reset();
+        if !pending.is_current() {
+            mouse_neutral(&mut writer).await;
+            continue;
         }
+        let deadline = pending.deadline();
+        mouse_neutral(&mut writer).await;
+        if !pending.is_current() {
+            mouse_neutral(&mut writer).await;
+            continue;
+        }
+        let completed = remotectl_shared::input_expiry::run_until_invalid(
+            MOUSE_USB_EVENT.wait(),
+            Timer::at(deadline),
+            execute_pointer(&mut writer, pending.action),
+        )
+        .await;
+        if !completed {
+            warn!("Mouse/media action expired or USB session changed");
+            mouse_neutral(&mut writer).await;
+        }
+    }
+}
+
+async fn execute_pointer(
+    writer: &mut HidWriter<'static, Driver<'static>, 5>,
+    action: PointerAction,
+) {
+    writer.ready().await;
+    let cmd = match action {
+        PointerAction::Mouse(cmd) => cmd,
+        PointerAction::Media(usage) => {
+            let [lo, hi] = usage.to_le_bytes();
+            if writer.write(&[2, lo, hi]).await.is_ok() {
+                Timer::after(Duration::from_millis(20)).await;
+            }
+            let _ = writer.write(&[2, 0, 0]).await;
+            return;
+        }
+    };
+    let ok = match cmd {
+        MouseCmd::Move { mut dx, mut dy } => {
+            let mut ok = true;
+            while ok && (dx != 0 || dy != 0) {
+                let (sx, sy) = (
+                    dx.clamp(-MOUSE_STEP, MOUSE_STEP),
+                    dy.clamp(-MOUSE_STEP, MOUSE_STEP),
+                );
+                ok = mouse_report(writer, 0, sx as i8, sy as i8, 0).await;
+                dx -= sx;
+                dy -= sy;
+                Timer::after(MOUSE_PAUSE).await;
+            }
+            ok
+        }
+        MouseCmd::Click { button, double } => {
+            let bit = match button {
+                MouseButton::Left => 0x01,
+                MouseButton::Right => 0x02,
+                MouseButton::Middle => 0x04,
+            };
+            let mut ok = mouse_click(writer, bit).await;
+            if ok && double {
+                Timer::after(Duration::from_millis(60)).await;
+                ok = mouse_click(writer, bit).await;
+            }
+            ok
+        }
+        MouseCmd::Scroll { amount } => mouse_report(writer, 0, 0, 0, amount).await,
+    };
+    if !ok {
+        warn!("USB mouse write failed, dropping the action");
     }
 }

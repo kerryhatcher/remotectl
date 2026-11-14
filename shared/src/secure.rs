@@ -166,6 +166,68 @@ mod tests {
     use crate::InputCommand;
 
     #[test]
+    fn keyboard_commands_are_authenticated_and_replay_protected() {
+        let signing = SigningKey::from_bytes(&[7; 32]);
+        let commands = [
+            InputCommand::TypeCommandReturn {
+                text: "test 2",
+                delay_ms: 15,
+            },
+            InputCommand::KeyChord {
+                modifiers: 8,
+                keys: [40, 0, 0, 0, 0, 0],
+            },
+            InputCommand::Media { usage: 0xe9 },
+            InputCommand::Unicode {
+                host: 1,
+                scalar: 0x1f600,
+            },
+            InputCommand::Unicode {
+                host: 2,
+                scalar: 0xe9,
+            },
+        ];
+        for (i, command) in commands.iter().enumerate() {
+            let challenge = [i as u8 + 1; 16];
+            let mut encoded = [0; 123];
+            let size = command.encode(&mut encoded).unwrap();
+            let mut packet = [0; MAX_PACKET];
+            let len = seal(
+                &[3; 32],
+                &signing,
+                &challenge,
+                1,
+                &[i as u8 + 1; 24],
+                &encoded[..size],
+                &mut packet,
+            )
+            .unwrap();
+            let mut receiver = Receiver::new(challenge);
+            let mut output = [0; 123];
+            assert_eq!(
+                receiver
+                    .open(
+                        &[3; 32],
+                        &signing.verifying_key(),
+                        &packet[..len],
+                        &mut output
+                    )
+                    .unwrap(),
+                *command
+            );
+            assert_eq!(
+                receiver.open(
+                    &[3; 32],
+                    &signing.verifying_key(),
+                    &packet[..len],
+                    &mut output
+                ),
+                Err(PacketError::Replay)
+            );
+        }
+    }
+
+    #[test]
     fn acknowledgments_require_the_key_challenge_and_untampered_status() {
         let key = [9; 32];
         let challenge = [3; 16];

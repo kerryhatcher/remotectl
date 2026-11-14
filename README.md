@@ -65,19 +65,47 @@ Firmware artifacts are written under the workspace root's `target/xtensa-esp32s3
 export REMOTECTL_PORT=/dev/ttyUSB1
 cargo run -p remotectl -- ping
 cargo run -p remotectl -- type 'Hello from remotectl'
+cargo run -p remotectl -- type 'test 2' --command-return
+cargo run -p remotectl -- key --modifiers 8 40  # Command/Super+Return
+cargo run -p remotectl -- media volume-up
+cargo run -p remotectl -- unicode linux 'café'
+cargo run -p remotectl -- unicode mac 'café'
 cargo run -p remotectl -- move -- -3 42
 cargo run -p remotectl -- click left
 cargo run -p remotectl -- scroll -- -2
+cargo run -p remotectl -- jiggle
 ```
 
 `move` uses signed relative HID counts; the host may apply pointer acceleration. `click` supports
 `left`, `right`, and `middle`, with optional `--double`. `scroll` accepts signed steps from -127
 to 127.
 
+`jiggle` continuously sends random pointer movements of -12 to +12 HID counts per axis
+at intervals of 1 to 10 seconds;
+press Ctrl+C to stop. It stops on a communication error. Radio transaction time can delay a
+movement beyond its scheduled interval.
+
+`key` sends up to six keyboard-page USB HID usages plus the modifier bitmask (left Ctrl=1,
+Shift=2, Alt/Option=4, GUI/Command/Super=8; right-side modifiers use 16, 32, 64, 128).
+It accepts decimal or `0x`-prefixed usage IDs and named keys such as `enter`, `up`, `f12`,
+`kp1`, and `kpenter`. `media` supports `volume-up`, `volume-down`, `mute`, `play-pause`,
+`next`, `previous`, or a numeric consumer-page usage. Keyboard-internal Fn/layer and lighting
+controls are not host-visible USB keyboard usages and cannot be reproduced by this interface.
+The boot keyboard supports six simultaneous ordinary keys plus modifiers, not N-key rollover.
+
+`unicode linux` uses Ctrl+Shift+U hexadecimal input in applications that support it;
+`unicode mac` requires the macOS Unicode Hex Input source to be selected. The macOS mode is
+limited to U+FFFF and rejects higher code points; both modes reject control characters. These
+Unicode paths and the media interface have not yet been verified on both operating systems.
+
 `type` accepts up to 120 ASCII bytes per request, using the US keyboard layout. Text goes to
 whatever has focus on the controlled computer. A successful command means the receiver accepted
-it into a USB input queue; it does not guarantee the host application processed the input. A
-timeout leaves execution uncertain, so retrying may duplicate input.
+it into a USB input queue; it does not guarantee the host application processed the input. The
+receiver clears queued input when USB suspends or disconnects, rejects new input while suspended,
+and cancels an action if it has not completed within 30 seconds of acceptance. A long text action
+can therefore be partially typed. If the computer stops polling without reporting USB suspend,
+a HID report already handed to the USB controller may still be delivered when polling resumes.
+A timeout leaves execution uncertain, so retrying may duplicate input.
 
 Each radio command is encrypted with XChaCha20-Poly1305 and signed with Ed25519. The receiver
 uses a fresh random challenge to reject replays and returns a challenge-bound authenticated

@@ -15,8 +15,13 @@ printf 'BOOTLOADER\n' > "$RECOVERY_PORT"
 # The ROM device may have a different path from the application's CDC device.
 for _ in $(seq 1 30); do
     if lsusb -d 303a:0009 | grep -q . && [ -c "$ROM_PORT" ]; then
-        exec espflash flash --chip esp32s3 --port "$ROM_PORT" --no-stub \
-            ../target/xtensa-esp32s3-none-elf/debug/firmware
+        if espflash flash --chip esp32s3 --port "$ROM_PORT" --no-stub \
+            ../target/xtensa-esp32s3-none-elf/debug/firmware; then
+            exit 0
+        fi
+        printf '%s\n' 'Flash failed; retrying once without resetting the ROM bootloader.' >&2
+        exec timeout 25s espflash flash --chip esp32s3 --port "$ROM_PORT" --no-stub \
+            --before no-reset ../target/xtensa-esp32s3-none-elf/debug/firmware
     fi
     sleep 1
 done

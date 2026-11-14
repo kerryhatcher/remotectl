@@ -159,25 +159,98 @@ async fn main(spawner: Spawner) -> ! {
         };
         use remotectl_shared::{InputCommand, MouseButton};
         use xiao_firmware::shared::{
-            MOUSE_QUEUE, MouseButton as HidButton, MouseCmd, TYPE_QUEUE, TypeJob,
+            MOUSE_QUEUE, MouseButton as HidButton, MouseCmd, Pending, TYPE_QUEUE, TypeJob,
+            usb_input_epoch,
         };
-        let connected =
-            xiao_firmware::shared::USB_CONFIGURED.load(core::sync::atomic::Ordering::Relaxed);
+        let epoch = usb_input_epoch();
         let status = match command {
             InputCommand::Ping => 0,
-            _ if !connected => 5,
-            InputCommand::Type { text, delay_ms } => match heapless::String::try_from(text) {
-                Ok(text) => {
-                    if TYPE_QUEUE.try_send(TypeJob { text, delay_ms }).is_ok() {
-                        0
-                    } else {
-                        6
-                    }
+            _ if epoch.is_none() => {
+                if xiao_firmware::shared::USB_SUSPENDED.load(core::sync::atomic::Ordering::SeqCst) {
+                    8
+                } else {
+                    5
                 }
-                Err(_) => 6,
-            },
+            }
+            InputCommand::Type { text, delay_ms }
+            | InputCommand::TypeCommandReturn { text, delay_ms } => {
+                let command_return = matches!(command, InputCommand::TypeCommandReturn { .. });
+                match heapless::String::try_from(text) {
+                    Ok(text) => {
+                        if TYPE_QUEUE
+                            .try_send(Pending::new(
+                                TypeJob {
+                                    text,
+                                    delay_ms,
+                                    command_return,
+                                    chord: None,
+                                    unicode: None,
+                                },
+                                epoch.unwrap(),
+                            ))
+                            .is_ok()
+                        {
+                            0
+                        } else {
+                            6
+                        }
+                    }
+                    Err(_) => 6,
+                }
+            }
+            InputCommand::KeyChord { modifiers, keys } => {
+                if TYPE_QUEUE
+                    .try_send(Pending::new(
+                        TypeJob {
+                            text: heapless::String::new(),
+                            delay_ms: 15,
+                            command_return: false,
+                            chord: Some((modifiers, keys)),
+                            unicode: None,
+                        },
+                        epoch.unwrap(),
+                    ))
+                    .is_ok()
+                {
+                    0
+                } else {
+                    6
+                }
+            }
+            InputCommand::Unicode { host, scalar } => {
+                if TYPE_QUEUE
+                    .try_send(Pending::new(
+                        TypeJob {
+                            text: heapless::String::new(),
+                            delay_ms: 15,
+                            command_return: false,
+                            chord: None,
+                            unicode: Some((host, scalar)),
+                        },
+                        epoch.unwrap(),
+                    ))
+                    .is_ok()
+                {
+                    0
+                } else {
+                    6
+                }
+            }
+            InputCommand::Media { usage } => {
+                if xiao_firmware::shared::MEDIA_QUEUE
+                    .try_send(Pending::new(usage, epoch.unwrap()))
+                    .is_ok()
+                {
+                    0
+                } else {
+                    6
+                }
+            }
             InputCommand::Move { dx, dy } => {
-                if MOUSE_QUEUE.try_send(MouseCmd::Move { dx, dy }).is_ok() {
+                if MOUSE_QUEUE
+                    .try_send(Pending::new(MouseCmd::Move { dx, dy }, epoch.unwrap()))
+                    .is_ok()
+                {
                     0
                 } else {
                     6
@@ -190,7 +263,10 @@ async fn main(spawner: Spawner) -> ! {
                     MouseButton::Middle => HidButton::Middle,
                 };
                 if MOUSE_QUEUE
-                    .try_send(MouseCmd::Click { button, double })
+                    .try_send(Pending::new(
+                        MouseCmd::Click { button, double },
+                        epoch.unwrap(),
+                    ))
                     .is_ok()
                 {
                     0
@@ -199,7 +275,10 @@ async fn main(spawner: Spawner) -> ! {
                 }
             }
             InputCommand::Scroll { amount } => {
-                if MOUSE_QUEUE.try_send(MouseCmd::Scroll { amount }).is_ok() {
+                if MOUSE_QUEUE
+                    .try_send(Pending::new(MouseCmd::Scroll { amount }, epoch.unwrap()))
+                    .is_ok()
+                {
                     0
                 } else {
                     6

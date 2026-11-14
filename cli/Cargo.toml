@@ -7,3 +7,4 @@ edition = "2024"
 remotectl-shared = { path = "../shared" }
 clap = { version = "4", features = ["derive", "env"] }
 serialport = { version = "4", default-features = false }
+rand = "0.9"
